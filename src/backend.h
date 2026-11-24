@@ -100,6 +100,8 @@ struct Backend {
     /// activation path needs the CUDA BF16 GEMM and elementwise kernels, so
     /// archs gate on this rather than on the compiled-in accelerator.
     bool           is_cuda = false;
+    /// True only for a live Hexagon (HTP) backend, never for the CPU fallback.
+    bool           is_hexagon = false;
     /// Same, for a live ROCm/HIP backend. It runs ggml-cuda's kernels, so graph
     /// choices made for those hold here too; vla.cpp's own CUDA kernels do not.
     bool           is_hip = false;
@@ -365,7 +367,7 @@ inline int backend_device_index() {
  * @param n_threads  Thread count handed to the CPU backend if it is used.
  * @return The backend plus the flags the arch records about it.
  */
-inline Backend backend_init(const char * tag, int n_threads) {
+inline Backend backend_init(const char * tag, int n_threads, bool hexagon_opfusion = false) {
     Backend b;
 
 #if defined(GGML_USE_CUDA) && !defined(GGML_USE_HIP)
@@ -523,7 +525,11 @@ inline Backend backend_init(const char * tag, int n_threads) {
             // the other backends are held to. Only a default: an explicit
             // GGML_HEXAGON_OPFUSION wins. Read at registry init, so set it first.
             static std::once_flag fuse_once;
-            std::call_once(fuse_once, [] { setenv_default("GGML_HEXAGON_OPFUSION", "0"); });
+            // hexagon_opfusion: an arch validated with fusion on opts in (SmolVLA, single device:
+            // bit-identical output, ~9% faster). Never for tensor split: fusing the bias Add into a
+            // row-parallel MUL_MAT adds it to every PARTIAL sum before ALLREDUCE (backend_tensor.cpp
+            // forces it off for that reason).
+            std::call_once(fuse_once, [hexagon_opfusion] { setenv_default("GGML_HEXAGON_OPFUSION", hexagon_opfusion ? "1" : "0"); });
             hexagon_default_skel_path();
             ggml_backend_reg_t reg  = ggml_backend_hexagon_reg();
             const char *       what = "Hexagon";
@@ -548,6 +554,9 @@ inline Backend backend_init(const char * tag, int n_threads) {
             } else if (!(accel = ggml_backend_dev_init(ggml_backend_reg_dev_get(reg, dev), nullptr))) {
                 std::fprintf(stderr, "%s: %s init failed; falling back to CPU\n", tag, what);
             } else if ((b.handle = fallback_backend_new(accel, n_threads)) != nullptr) {
+#ifdef GGML_USE_HEXAGON
+                b.is_hexagon = true;
+#endif
                 std::printf("%s: backend = %s (%s), rejected ops on CPU (%d threads)\n",
                             tag, what, ggml_backend_name(b.handle), n_threads);
             }

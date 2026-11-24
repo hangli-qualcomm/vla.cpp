@@ -394,6 +394,11 @@ void usage(const char * prog) {
         "                                    replaces it and the old one is answered with\n"
         "                                    error=\"superseded\"\n"
         "                          'fifo'  : serve every request in arrival order\n"
+        "  --pipeline-devices V,V,..:L  SmolVLA: one vision-tower instance per device V (the\n"
+        "                          views of a request fan out over them in parallel), the LM\n"
+        "                          and action expert on device L. Device ids index the\n"
+        "                          registry, as VLA_DEVICE does; GGML_HEXAGON_DEVICES must\n"
+        "                          expose them. e.g. 0,1,2:3 on a 4-HTP board\n"
         "  --timing-detail LEVEL   per-request timing breakdown (default: none)\n"
         "                          'none'  : single ms_inference\n"
         "                          'phase' : ms_prefill + ms_denoise broken out\n"
@@ -430,6 +435,7 @@ int main(int argc, char ** argv) {
     std::string hf_spec;
     std::string config_path;
     vla::TimingDetail timing_detail = vla::TimingDetail::NONE;
+    std::string pipeline_spec;
     int warmup = 1;
     vla::serving::QueueMode queue_mode = vla::serving::QueueMode::LATEST;
     vla::Options opts;
@@ -444,6 +450,8 @@ int main(int argc, char ** argv) {
             hf_spec = argv[++i];
         } else if (a == "--config" && i+1 < argc) {
             config_path = argv[++i];
+        } else if (a == "--pipeline-devices" && i+1 < argc) {
+            pipeline_spec = argv[++i];
         } else if (a == "--warmup" && i+1 < argc) {
             warmup = std::atoi(argv[++i]);
         } else if (a == "--queue" && i+1 < argc) {
@@ -515,11 +523,47 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    vla::Model * model = vla::model_load(mmproj_path, ckpt_path, config_path, opts);
+    // --pipeline-devices V0,V1,..:L. One vision-only instance per V (each loads the whole
+    // checkpoint on its own device), and the LM instance on L. Device selection goes
+    // through VLA_DEVICE, which backend_init reads at model_load.
+    std::vector<vla::Model *> vmodels;
+    vla::Model * model = nullptr;
+    if (!pipeline_spec.empty()) {
+        const size_t colon = pipeline_spec.find(':');
+        if (colon == std::string::npos || colon == 0 || colon+1 >= pipeline_spec.size()) {
+            std::fprintf(stderr, "vla-server: --pipeline-devices expects V0,V1,..:L\n");
+            return 1;
+        }
+        std::vector<std::string> vdev;
+        {
+            std::string cur;
+            for (char c : pipeline_spec.substr(0, colon)) {
+                if (c == ',') { vdev.push_back(cur); cur.clear(); } else cur += c;
+            }
+            vdev.push_back(cur);
+        }
+        for (const std::string & d : vdev) {
+            setenv("VLA_DEVICE", d.c_str(), 1);
+            std::printf("vla-server: loading vision instance on device %s\n", d.c_str());
+            vla::Model * vm = vla::model_load(mmproj_path, ckpt_path, config_path, opts);
+            if (!vm) {
+                std::fprintf(stderr, "vla-server: vision model_load failed (device %s)\n", d.c_str());
+                return 1;
+            }
+            vmodels.push_back(vm);
+        }
+        const std::string ldev = pipeline_spec.substr(colon+1);
+        setenv("VLA_DEVICE", ldev.c_str(), 1);
+        std::printf("vla-server: loading LM instance on device %s\n", ldev.c_str());
+    }
+    model = vla::model_load(mmproj_path, ckpt_path, config_path, opts);
     if (!model) {
         std::fprintf(stderr, "vla-server: model_load failed\n");
         return 1;
     }
+    const bool pipe_on = !vmodels.empty();
+    if (pipe_on)
+        std::printf("vla-server: pipeline mode: %zu vision instance(s) + 1 LM instance\n", vmodels.size());
     const auto & cfg = vla::model_config(model);
     std::printf("vla-server: loaded. chunk_size=%lld  action_dim=%lld  "
                 "n_lang=%lld  hidden=%lld  expert_h=%lld  timing_detail=%s  queue=%s\n",
@@ -527,8 +571,11 @@ int main(int argc, char ** argv) {
                 (long long) cfg.n_lang, (long long) cfg.hidden, (long long) cfg.expert_h,
                 timing_detail == vla::TimingDetail::PHASE ? "phase" : "none",
                 vla::serving::queue_mode_name(queue_mode));
-    if (warmup > 0)
+    if (warmup > 0) {
+        for (vla::Model * v : vmodels)
+            warm_up(v, cfg, warmup);
         warm_up(model, cfg, warmup);
+    }
 
     zmq::context_t zctx(1);
     // ROUTER rather than REP: replies carry the peer's identity, so the socket
@@ -585,8 +632,59 @@ int main(int argc, char ** argv) {
             const auto t_start = Clock::now();
             const float ms_queue = std::chrono::duration<float, std::milli>(t_start - job.t_recv).count();
 
+            // Pipeline mode: view v goes to vision instance v % n on its own thread, and the
+            // concatenated embeddings reach the LM instance as precomputed_img_emb.
+            std::vector<float> pipe_emb;
+            float pipe_ms_vision = 0.f;
+            bool  pipe_done      = false;
+            if (pipe_on && !job.use_precomputed) {
+                const int64_t per_view = cfg.n_img*cfg.hidden;
+                const int     n_views  = static_cast<int>(job.img_views.size());
+                const int     nW       = static_cast<int>(vmodels.size());
+                pipe_emb.assign(size_t(per_view)*size_t(n_views), 0.f);
+                std::vector<std::string> werr(nW);
+                const auto tp0 = Clock::now();
+                auto run_worker = [&](int w) {
+                    for (int v=w; v<n_views; v+=nW) {
+                        int32_t tok = 0;
+                        float   st0[1] = {0.f};
+                        vla::Inputs vin{};
+                        vin.images      = &job.img_views[v];
+                        vin.n_images    = 1;
+                        vin.lang_tokens = &tok;
+                        vin.n_lang      = 1;
+                        vin.state       = st0;
+                        vin.vision_only = true;
+                        std::vector<float> e = vla::predict(vmodels[w], vin);
+                        if (int64_t(e.size()) != per_view) { werr[w] = "vision tower failed"; return; }
+                        std::memcpy(pipe_emb.data()+size_t(v)*size_t(per_view), e.data(),
+                                    size_t(per_view)*sizeof(float));
+                    }
+                };
+                std::vector<std::thread> th;
+                for (int w=1; w<nW && w<n_views; ++w)
+                    th.emplace_back(run_worker, w);
+                run_worker(0);
+                for (auto & t : th)
+                    t.join();
+                pipe_ms_vision = std::chrono::duration<float, std::milli>(Clock::now()-tp0).count();
+                std::string perr;
+                for (const auto & e : werr)
+                    if (!e.empty()) perr = e;
+                if (!perr.empty()) {
+                    send_multipart(reply_push, job.envelope, make_error_response(job.rid, perr));
+                    continue;
+                }
+                pipe_done = true;
+            }
+
             vla::Inputs in;
-            if (job.use_precomputed) {
+            if (pipe_done) {
+                in.precomputed_img_emb = pipe_emb.data();
+                in.n_img_views         = static_cast<int>(job.img_views.size());
+                in.images              = nullptr;
+                in.n_images            = 0;
+            } else if (job.use_precomputed) {
                 in.precomputed_img_emb = job.precomputed_emb.data();
                 in.n_img_views         = job.precomputed_n_views;
                 in.images              = nullptr;
@@ -606,7 +704,8 @@ int main(int argc, char ** argv) {
             in.timing_detail    = timing_detail;
 
             std::vector<float> action_chunk = vla::predict(model, in);
-            const auto & st = vla::last_stats(model);
+            vla::Stats st = vla::last_stats(model);
+            if (pipe_done) { st.ms_vision = pipe_ms_vision; st.ms_total += pipe_ms_vision; }
 
             std::string body;
             if (action_chunk.empty()) {
@@ -753,6 +852,8 @@ int main(int argc, char ** argv) {
     reply_pull.close();
     sock.close();
     zctx.close();
+    for (vla::Model * v : vmodels)
+        vla::model_free(v);
     vla::model_free(model);
     google::protobuf::ShutdownProtobufLibrary();
     return 0;

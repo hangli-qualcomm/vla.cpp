@@ -84,6 +84,11 @@ struct Config {
     /// True if @ref predict already applied the dataset statistics. False for the
     /// GR00T family and VLA-JEPA, whose callers un-normalise from a stats JSON.
     bool    denormalized = true;
+
+    /// Storage width of the K (input) dim of action-expert GEMMs fed by a hidden
+    /// state: expert_h rounded up to HMX's 32-column tile when padding is on, else
+    /// expert_h. 0 = not resolved yet.
+    int64_t expert_hp = 0;
 };
 
 /// Opaque engine handle; created by @ref model_load and released by
@@ -151,6 +156,12 @@ struct Inputs {
     int              attention_mask_n = 0;     ///< Length of @ref attention_mask.
 
     TimingDetail     timing_detail    = TimingDetail::NONE;
+
+    /// SmolVLA only: run just the vision tower and return the image embeddings
+    /// ([n_images * n_img * hidden]); the LM and action expert are skipped. Lets a
+    /// server fan the views out over several devices and hand the result to the
+    /// LM instance through @ref precomputed_img_emb.
+    bool             vision_only      = false;
 };
 
 /**

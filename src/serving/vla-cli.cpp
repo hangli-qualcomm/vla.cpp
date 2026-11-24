@@ -44,6 +44,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -272,6 +273,7 @@ int main(int argc, char ** argv) {
     std::string mmproj, ckpt, hf, tokens_s, state_s, text_s, config_path;
     std::vector<std::string> image_paths;
     bool pretty = false;
+    std::string noise_path;   // raw little-endian float32, chunk_size * max_action_dim; default: sampled N(0,1)
     bool libero = false;
     Options opts;
     std::string opt_err;
@@ -293,6 +295,7 @@ int main(int argc, char ** argv) {
         else if (a == "--tokens")  tokens_s = need("--tokens");
         else if (a == "--text")    text_s = need("--text");
         else if (a == "--state")   state_s = need("--state");
+        else if (a == "--noise")   noise_path = need("--noise");
         else if (a == "--pretty")  pretty = true;
         else if (a == "--libero")  libero = true;
         else if (a == "--config")  config_path = need("--config");
@@ -422,7 +425,27 @@ int main(int argc, char ** argv) {
         in.attention_mask_n = (int) attn.size();
     }
     in.state       = state.data();
-    in.noise       = nullptr;  // predict() samples N(0,1) when omitted
+    std::vector<float> noise;
+    if (!noise_path.empty()) {
+        // Fixed noise makes two runs (CPU reference vs an accelerator) comparable.
+        std::FILE * nf = std::fopen(noise_path.c_str(), "rb");
+        if (!nf) {
+            std::fprintf(stderr, "vla-cli: cannot open --noise %s\n", noise_path.c_str());
+            model_free(m);
+            return 1;
+        }
+        noise.resize((size_t) (cfg.n_suffix * cfg.max_action_dim));
+        const size_t got = std::fread(noise.data(), sizeof(float), noise.size(), nf);
+        std::fclose(nf);
+        if (got != noise.size()) {
+            std::fprintf(stderr, "vla-cli: --noise has %zu floats, need %zu\n", got, noise.size());
+            model_free(m);
+            return 1;
+        }
+        in.noise = noise.data();
+    } else {
+        in.noise = nullptr;  // predict() samples N(0,1) when omitted
+    }
 
     std::vector<float> act = predict(m, in);
     if (act.empty()) {

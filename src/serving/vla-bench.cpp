@@ -199,8 +199,10 @@ int main(int argc, char ** argv) {
             vla::model_free(m);
             return 1;
         }
-        ms.push_back(std::chrono::duration<double, std::milli>(t1-t0).count());
+        const double call_ms = std::chrono::duration<double, std::milli>(t1-t0).count();
+        ms.push_back(call_ms);
         vision_sum += vla::last_stats(m).ms_vision;
+        std::fprintf(stderr, "%s: call %d/%d took %.1f ms\n", label.c_str(), i+1, reps, call_ms);
     }
 
     std::sort(ms.begin(), ms.end());
